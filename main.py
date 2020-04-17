@@ -11,16 +11,23 @@ from google.oauth2.service_account import Credentials
 import jwt
 from requests import Request
 from requests import Session
-
+import json
+import fnmatch
 
 IAM_SCOPE = 'https://www.googleapis.com/auth/iam'
 OAUTH_TOKEN_URI = 'https://www.googleapis.com/oauth2/v4/token'
-HOST_HEADER = 'Forward-Host'
+TARGET_HOST = os.getenv('TARGET_HOST')
+SECRET_HEADER = os.getenv('SECRET_HEADER')
+if not SECRET_HEADER:
+    SECRET_HEADER = 'X-Gitlab-Token'
+# To match the Spinnaker Payload Constraints key
+SECRET_KEY = os.getenv('SECRET_KEY')
 
 _oidc_token = None
 _session = Session()
 _adc_credentials, _ = google.auth.default(scopes=[IAM_SCOPE])
 
+# Example for whitelist: gate/webhooks/webhook/
 _whitelist = os.getenv('WHITELIST', [])
 if _whitelist:
     _whitelist = [p.strip() for p in _whitelist.split(',')]
@@ -76,9 +83,7 @@ def handle_request(proxied_request):
     error.
     """
 
-    host = proxied_request.headers.get(HOST_HEADER)
-    if not host:
-        return 'Required header {} not present'.format(HOST_HEADER), 400
+    host = TARGET_HOST
 
     scheme = proxied_request.headers.get('X-Forwarded-Proto', 'https')
     url = '{}://{}{}'.format(scheme, host, proxied_request.path)
@@ -88,11 +93,17 @@ def handle_request(proxied_request):
     path = proxied_request.path
     if not path:
         path = '/'
-    # TODO: Implement proper wildcarding for paths.
-    if '*' not in _whitelist and path not in _whitelist:
-        logging.warn('Rejected {} {}, not in whitelist'.format(
-            proxied_request.method, url))
-        return 'Requested path {} not in whitelist'.format(path), 403
+
+    if '*' not in _whitelist:
+        _is_match = False
+        for entry in _whitelist:
+            if fnmatch.fnmatch(path, entry):
+                _is_match = True
+                break
+        if not _is_match:
+            logging.warn('Rejected {} {}, not in whitelist'.format(
+                proxied_request.method, url))
+            return 'Requested path {} not in whitelist'.format(path), 403
 
     global _oidc_token
     if not _oidc_token or _oidc_token.is_expired():
@@ -103,11 +114,23 @@ def handle_request(proxied_request):
     # Add the Authorization header with the OIDC token.
     headers['Authorization'] = 'Bearer {}'.format(_oidc_token)
 
+    webhook_body = proxied_request.data
+    gitlab_secret = proxied_request.headers.get(SECRET_HEADER, '')
+    if SECRET_KEY:
+        try:
+            _body = json.loads(webhook_body)
+            # Add the Gitlab secret token into the request body
+            _body[SECRET_KEY] = gitlab_secret
+            webhook_body = json.dumps(_body)
+        except json.JSONDecodeError as e:
+            return 'Failed to decode webhook body', 500
+
+    print('(%s)' % webhook_body)
     # We don't want to forward the Host header.
     headers.pop('Host', None)
     request = Request(proxied_request.method, url,
                       headers=headers,
-                      data=proxied_request.data)
+                      data=webhook_body)
 
     # Send the proxied request.
     prepped = request.prepare()
